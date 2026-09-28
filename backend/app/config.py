@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     SCRAPER_MODE: str = "hybrid"
     REQUEST_TIMEOUT_SECONDS: float = 12.0
     MAX_RESULTS_PER_MARKETPLACE: int = 40
+    # Optional: ScraperAPI key for residential IP proxying (bypasses Amazon/Flipkart bot protection)
+    # Get free key at https://www.scraperapi.com — 1000 free requests/month
+    SCRAPERAPI_KEY: str = ""
     AMAZON_BASE_URL: str = "https://www.amazon.in"
     FLIPKART_BASE_URL: str = "https://www.flipkart.com"
 

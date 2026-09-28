@@ -28,6 +28,15 @@ class FlipkartScraper(BaseMarketplaceScraper):
     def __init__(self):
         super().__init__(Marketplace.FLIPKART, settings.FLIPKART_BASE_URL)
 
+    def _build_request_url(self, search_url: str) -> str:
+        """Route through ScraperAPI residential proxy if key is configured."""
+        key = getattr(settings, "SCRAPERAPI_KEY", None)
+        if key:
+            import urllib.parse as _up
+            encoded = _up.quote_plus(search_url)
+            return f"https://api.scraperapi.com/?api_key={key}&url={encoded}&country_code=in&render=false"
+        return search_url
+
     async def search(self, query: str, max_results: int = 40) -> Tuple[List[MarketplaceOffer], MarketplaceStatus]:
         start_time = time.time()
         encoded_query = urllib.parse.quote_plus(query)
@@ -47,7 +56,7 @@ class FlipkartScraper(BaseMarketplaceScraper):
         try:
             headers = self.get_headers()
             async with httpx.AsyncClient(headers=headers, timeout=self.timeout, follow_redirects=True) as client:
-                response = await client.get(search_url)
+                response = await client.get(self._build_request_url(search_url))
 
             elapsed_ms = round((time.time() - start_time) * 1000, 1)
 
