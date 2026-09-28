@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  product-finder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: product_finder_app
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_NAME=Product Finder API
+      - APP_ENV=production
+      - DEBUG=False
+      - HOST=0.0.0.0
+      - PORT=8000
+      - SCRAPER_MODE=hybrid
+      - BAYESIAN_MIN_REVIEWS=50
+      - BAYESIAN_BASELINE_RATING=4.0
+      - WEIGHT_RATING_CONFIDENCE=0.40
+      - WEIGHT_PRICE_VALUE=0.30
+      - WEIGHT_REQUIREMENTS=0.20
+      - WEIGHT_AVAILABILITY=0.10
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
