@@ -1,3 +1,4 @@
+import hashlib
 import random
 import re
 import urllib.parse
@@ -290,7 +291,7 @@ def generate_mock_offers_for_query(query: str, marketplace: Marketplace) -> List
             gallery = item.get("images") or [item["img"]]
             offer = MarketplaceOffer(
                 marketplace=marketplace,
-                product_id=f"{marketplace.value.lower()}_{idx}_{uuid.uuid4().hex[:6]}",
+                product_id=f"{marketplace.value.lower()}_{hashlib.md5(item['name'].encode()).hexdigest()[:10]}",
                 title=f"{item['name']}",
                 price=float(data["price"]),
                 original_price=float(data["orig"]),

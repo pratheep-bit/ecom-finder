@@ -1,6 +1,6 @@
 import re
 import uuid
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Set
 from rapidfuzz import fuzz
 
 from backend.app.models.product import (
@@ -15,6 +15,51 @@ from backend.app.normalizers.product import (
     clean_specifications,
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Generic noise tokens that MUST NOT influence fuzzy matching.
+# These tokens are shared across MANY different products (iPhone, Pixel, Galaxy…)
+# and contribute to false cross-product matches when left in the title string.
+# ─────────────────────────────────────────────────────────────────────────────
+_NOISE_TOKENS: Set[str] = {
+    # Connectivity
+    "5g", "4g", "3g", "lte", "wifi", "wi-fi", "bluetooth",
+    # Storage sizes — caught separately by extract_variant_attributes
+    "128gb", "256gb", "512gb", "64gb", "32gb", "1tb", "2tb",
+    "rom", "storage",
+    # RAM sizes
+    "4gb", "6gb", "8gb", "12gb", "16gb",
+    "ram",
+    # Display
+    "amoled", "oled", "lcd", "ips", "2k", "4k", "fhd", "hd",
+    "60hz", "90hz", "120hz", "144hz",
+    # Common marketing suffixes
+    "india", "edition", "version", "new", "official", "latest",
+    # Common colors — color words must NOT cause cross-product false matches
+    "black", "white", "blue", "green", "red", "gold", "silver", "graphite",
+    "midnight", "starlight", "purple", "yellow", "lavender", "coral",
+    "titanium", "natural", "hazel", "obsidian", "sage", "mint",
+    "onyx", "ivory", "phantom", "prism", "emerald", "flowy",
+    # Camera
+    "mp", "camera",
+}
+
+_NOISE_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in sorted(_NOISE_TOKENS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_noise(title: str) -> str:
+    """
+    Removes generic noise tokens from a title string, leaving only
+    brand-identifying and model-identifying tokens for fuzzy comparison.
+    Parenthetical color/storage like (Blue, 128 GB) are also removed.
+    """
+    cleaned = _NOISE_RE.sub(" ", title)
+    cleaned = re.sub(r"\(.*?\)", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
 
 def extract_model_identifiers(title: str) -> List[str]:
     """
@@ -22,17 +67,15 @@ def extract_model_identifiers(title: str) -> List[str]:
     e.g. 'Galaxy S24', 'iPhone 15', 'RTX 4060', 'WH-1000XM4', 'Edge 50 Pro', 'S23'
     """
     tokens = []
-    # 1. Alphanumeric tokens e.g. S24, M34, WH-1000XM4
     candidates = re.findall(
         r"\b[A-Za-z0-9]+-[A-Za-z0-9]+\b|\b[A-Za-z]+[0-9]+[A-Za-z0-9]*\b|\b[0-9]+[A-Za-z]+[A-Za-z0-9]*\b",
         title
     )
     for c in candidates:
         c_clean = c.lower()
-        if len(c_clean) >= 2 and c_clean not in ("5g", "4g", "3g", "8gb", "6gb", "4gb", "12gb", "16gb", "128gb", "256gb", "512gb", "1tb", "2k", "4k"):
+        if len(c_clean) >= 2 and c_clean not in _NOISE_TOKENS:
             tokens.append(c_clean)
 
-    # 2. Key series + number patterns: "iPhone 15", "Pixel 8", "OnePlus 12", "Note 13", "Edge 50", "Galaxy S24"
     series_patterns = [
         r"\biphone\s+(\d+(?:\s*(?:pro\s*max|pro|plus|mini))?)\b",
         r"\bpixel\s+(\d+(?:\s*(?:pro|a))?)\b",
@@ -43,6 +86,8 @@ def extract_model_identifiers(title: str) -> List[str]:
         r"\bm\s*(\d+)\b",
         r"\ba\s*(\d+)\b",
         r"\bmacbook\s+(air|pro)?\s*(m\d|a\d+)?\b",
+        r"\biqoo\s+(\d+)\b",
+        r"\bxiaomi\s+(\d+)\b",
     ]
     for pat in series_patterns:
         matches = re.findall(pat, title, re.IGNORECASE)
@@ -73,63 +118,67 @@ def extract_variant_attributes(title: str) -> Dict[str, Optional[str]]:
 
 def are_offers_same_product(offer_a: MarketplaceOffer, offer_b: MarketplaceOffer) -> Tuple[bool, float]:
     """
-    Determines whether two marketplace offers refer to the same physical product.
-    Requires:
-    1. Matching Brand (or generic similarity)
-    2. High fuzzy similarity on normalized titles (RapidFuzz token_set_ratio and token_sort_ratio)
-    3. No conflicting hardware tiers (e.g. 128GB cannot merge with 256GB)
-    4. No conflicting model generation identifiers (e.g. S23 can NEVER merge with S24)
+    Determines whether two marketplace offers refer to the SAME physical product.
+
+    Rules (all must pass):
+    1. Different marketplaces (Amazon vs Flipkart only)
+    2. Same brand — if both have a known brand, they MUST match exactly
+    3. No conflicting hardware variants (128 GB != 256 GB)
+    4. No conflicting model generation identifiers (S23 != S24, iPhone 15 != iPhone 14)
+    5. High fuzzy similarity on NOISE-STRIPPED titles
+       (generic tokens like 5G, 8 GB RAM are stripped so they cannot cause false matches)
+    6. Common model identifiers must exist in the intersection
     """
     if offer_a.marketplace == offer_b.marketplace:
         return False, 0.0
 
+    # Rule 2: Strict brand matching
     brand_a = extract_brand(offer_a.title).lower()
     brand_b = extract_brand(offer_b.title).lower()
-
     if brand_a != "generic" and brand_b != "generic" and brand_a != brand_b:
         return False, 0.0
 
-    norm_a = normalize_title(offer_a.title)
-    norm_b = normalize_title(offer_b.title)
-
-    # Check hardware variants (RAM/Storage)
+    # Rule 3: Hardware variant guard
     var_a = extract_variant_attributes(offer_a.title)
     var_b = extract_variant_attributes(offer_b.title)
-
     if var_a["storage"] and var_b["storage"] and var_a["storage"] != var_b["storage"]:
         return False, 0.0
     if var_a["ram"] and var_b["ram"] and var_a["ram"] != var_b["ram"]:
         return False, 0.0
 
-    # RapidFuzz fuzzy token comparison
-    token_sort = fuzz.token_sort_ratio(norm_a, norm_b)
-    token_set = fuzz.token_set_ratio(norm_a, norm_b)
-    partial = fuzz.partial_ratio(norm_a, norm_b)
-
-    # Check for model code matches (e.g. 'wh-1000xm4' or 'm34' or 's23')
+    # Rule 4: Model generation guard
     models_a = extract_model_identifiers(offer_a.title)
     models_b = extract_model_identifiers(offer_b.title)
-
-    # CRITICAL: Strict Model Disjoint Guardrail
-    # If both offers specify distinct model generations/series (e.g. ['s24'] vs ['s23'] or ['15'] vs ['14']),
-    # they are different hardware models. NEVER merge them regardless of token overlap.
+    # If both sides have model identifiers and they are completely disjoint -> different products
     if models_a and models_b and set(models_a).isdisjoint(set(models_b)):
         return False, 0.0
 
     common_models = set(models_a).intersection(set(models_b))
 
+    # Rule 5: Fuzzy similarity on NOISE-STRIPPED titles
+    stripped_a = _strip_noise(offer_a.title)
+    stripped_b = _strip_noise(offer_b.title)
+
+    token_sort = fuzz.token_sort_ratio(stripped_a, stripped_b)
+    token_set  = fuzz.token_set_ratio(stripped_a, stripped_b)
+    partial    = fuzz.partial_ratio(stripped_a, stripped_b)
+
+    # Rule 6: Common model identifier shortcut
+    # If both titles share an explicit model code (e.g. 's23', 'wh-1000xm4'),
+    # a high token_sort on stripped titles is sufficient to confirm a match.
     if common_models:
-        # With matching model code and same brand, token_set_ratio >= 60 confirms match
-        if token_set >= 60.0:
-            return True, max(token_set, token_sort)
+        if token_sort >= 75.0 or token_set >= 70.0:
+            return True, max(token_sort, token_set)
 
-    composite_score = (token_sort * 0.40) + (token_set * 0.45) + (partial * 0.15)
-    threshold = 72.0 if common_models else 80.0
+    # Final composite threshold — raised to prevent cross-product false merges
+    composite = (token_sort * 0.45) + (token_set * 0.40) + (partial * 0.15)
+    # 90 when no model overlap; 80 when partial model overlap exists
+    threshold = 80.0 if common_models else 90.0
 
-    if composite_score >= threshold or token_set >= 85.0:
-        return True, max(composite_score, token_set)
+    if composite >= threshold or token_set >= 92.0:
+        return True, max(composite, token_set)
 
-    return False, composite_score
+    return False, composite
 
 
 def merge_offers_into_unified_product(
@@ -155,24 +204,22 @@ def merge_offers_into_unified_product(
         else:
             flipkart_offer = secondary_offer
 
-    # Calculate best price & marketplace deal comparison
     if amazon_offer and flipkart_offer:
         if amazon_offer.price < flipkart_offer.price:
             best_price = amazon_offer.price
             best_market = Marketplace.AMAZON
             diff = flipkart_offer.price - amazon_offer.price
-            deal_summary = f"Amazon — ₹{best_price:,.0f} (₹{diff:,.0f} lower than Flipkart)"
+            deal_summary = f"Amazon — \u20b9{best_price:,.0f} (\u20b9{diff:,.0f} lower than Flipkart)"
         elif flipkart_offer.price < amazon_offer.price:
             best_price = flipkart_offer.price
             best_market = Marketplace.FLIPKART
             diff = amazon_offer.price - flipkart_offer.price
-            deal_summary = f"Flipkart — ₹{best_price:,.0f} (₹{diff:,.0f} lower than Amazon)"
+            deal_summary = f"Flipkart — \u20b9{best_price:,.0f} (\u20b9{diff:,.0f} lower than Amazon)"
         else:
             best_price = amazon_offer.price
             best_market = Marketplace.AMAZON
-            deal_summary = f"Same Price on Both — ₹{best_price:,.0f}"
+            deal_summary = f"Same Price on Both — \u20b9{best_price:,.0f}"
 
-        # Aggregate weighted rating
         total_rev = amazon_offer.review_count + flipkart_offer.review_count
         if total_rev > 0:
             agg_rating = (
@@ -187,7 +234,7 @@ def merge_offers_into_unified_product(
             amazon_offer.original_price or best_price,
             flipkart_offer.original_price or best_price,
         )
-        # Select descriptive product title (avoid picking single-word stubs like 'HP' or 'Lenovo')
+
         t1 = primary_offer.title.strip()
         t2 = secondary_offer.title.strip()
         if len(t1) < 15 and len(t2) >= 15:
@@ -201,23 +248,16 @@ def merge_offers_into_unified_product(
         else:
             clean_title = t1 if len(t1) >= len(t2) else t2
 
-        img_list = []
-        for img in [primary_offer.image_url, secondary_offer.image_url]:
+        # Build image list — Amazon CDN image comes first (correct product image)
+        img_list: List[str] = []
+        for img in [amazon_offer.image_url] + list(getattr(amazon_offer, "images", [])):
             if img and img not in img_list:
                 img_list.append(img)
-        for img in getattr(primary_offer, "images", []) + getattr(secondary_offer, "images", []):
+        for img in [flipkart_offer.image_url] + list(getattr(flipkart_offer, "images", [])):
             if img and img not in img_list:
                 img_list.append(img)
 
-        # Prioritize live scraped marketplace image (e.g. from Flipkart CDN rukminim/flixcart)
-        # over any static catalog fallback
-        live_img = None
-        for img in img_list:
-            if "rukminim" in img or "flixcart" in img:
-                live_img = img
-                break
-
-        image_url = live_img if live_img else (img_list[0] if img_list else primary_offer.image_url)
+        image_url = img_list[0] if img_list else primary_offer.image_url
 
         availability = (
             "In Stock"
@@ -229,11 +269,10 @@ def merge_offers_into_unified_product(
         )
 
     else:
-        # Single marketplace offer
         active = primary_offer
         best_price = active.price
         best_market = active.marketplace
-        deal_summary = f"{active.marketplace.value} — ₹{best_price:,.0f}"
+        deal_summary = f"{active.marketplace.value} — \u20b9{best_price:,.0f}"
         agg_rating = active.rating
         review_count = active.review_count
         original_price = active.original_price
@@ -257,7 +296,6 @@ def merge_offers_into_unified_product(
     brand = extract_brand(clean_title)
     product_id = f"prod_{uuid.uuid4().hex[:10]}"
 
-    # Initial dummy scoring breakdown (populated later by ranker)
     dummy_breakdown = ScoringBreakdown(
         raw_rating=round(agg_rating, 2),
         review_count=review_count,
@@ -300,7 +338,7 @@ def deduplicate_marketplace_offers(
     and retaining single-marketplace products.
     """
     unified_products: List[UnifiedProduct] = []
-    matched_fk_indices = set()
+    matched_fk_indices: set = set()
 
     for amz in amazon_offers:
         best_match_idx = None
@@ -316,17 +354,14 @@ def deduplicate_marketplace_offers(
                 best_match_idx = idx
 
         if best_match_idx is not None:
-            # Found pair
             fk_match = flipkart_offers[best_match_idx]
             matched_fk_indices.add(best_match_idx)
             unified = merge_offers_into_unified_product(amz, fk_match)
             unified_products.append(unified)
         else:
-            # Amazon only
             unified = merge_offers_into_unified_product(amz)
             unified_products.append(unified)
 
-    # Remaining Flipkart offers not paired
     for idx, fk in enumerate(flipkart_offers):
         if idx not in matched_fk_indices:
             unified = merge_offers_into_unified_product(fk)
